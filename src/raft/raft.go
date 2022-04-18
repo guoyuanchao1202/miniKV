@@ -18,8 +18,12 @@ package raft
 //
 
 import (
+	"6.824/labgob"
 	"6.824/utils"
+	"bytes"
 	"context"
+	"log"
+
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -46,13 +50,13 @@ type Raft struct {
 
 }
 
-// GetState return currentTerm and whether this server
+// GetState return CurrentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
 
-	return rf.state.currentTerm, rf.state.role == LeaderRole
+	return rf.state.CurrentTerm, rf.state.role == LeaderRole
 }
 
 //
@@ -128,10 +132,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 
 	if rf.state.role != LeaderRole {
-		return InvalidIndex, rf.state.currentTerm, false
+		return InvalidIndex, rf.state.CurrentTerm, false
 	}
 
-	DPrintf("Leader(Term[%d]) %d receive command: %v", rf.state.currentTerm, rf.self, command)
+	DPrintf("Leader(Term[%d]) %d receive command: %v", rf.state.CurrentTerm, rf.self, command)
 
 	entry := rf.addToLogCache(command)
 
@@ -140,7 +144,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) addToLogCache(command interface{}) LogEntry {
 	entry := LogEntry{
-		Term:  rf.state.currentTerm,
+		Term:  rf.state.CurrentTerm,
 		Index: rf.state.nextIndex[rf.self],
 		Data:  command,
 	}
@@ -178,28 +182,38 @@ func (rf *Raft) Kill() {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = args.Term
 
+	persistVoteFor := 0
+	persistCurrentTerm := 0
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	reply.VoteGranted = rf.tryVote(args)
 	if reply.VoteGranted {
-		rf.state.votedFor = args.CandidateID
+		persistVoteFor = args.CandidateID
+		persistVoteFor = rf.state.CurrentTerm
+		rf.state.VotedFor = args.CandidateID
 		rf.markAccessed()
 	}
 
-	if rf.state.currentTerm > args.Term {
-		reply.Term = rf.state.currentTerm
-	} else if rf.state.currentTerm < args.Term {
+	if rf.state.CurrentTerm > args.Term {
+		reply.Term = rf.state.CurrentTerm
+	} else if rf.state.CurrentTerm < args.Term {
 		rf.becomeFollower(args.Term)
 	}
 
 	DPrintf("server %d vote to %d, reply.Term: %d, reply.Vote: %t", rf.self, args.CandidateID, reply.Term, reply.VoteGranted)
+	rf.mu.Unlock()
+
+	if persistVoteFor != 0 {
+		if err := rf.persistVoteInfo(persistVoteFor, persistCurrentTerm); err != nil {
+			DPrintf("Persist VoteInfo failed, err: %s", err.Error())
+		}
+	}
 
 	return
 }
 
 func (rf *Raft) becomeFollower(newTerm int) {
-	rf.state.currentTerm = newTerm
+	rf.state.CurrentTerm = newTerm
 	rf.state.role = FollowerRole
 }
 
@@ -215,13 +229,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	DPrintf("Server(Term[%d], commitIndex[%d], nextIndex[%d], matchIndex[%d]) %d receive entries from Leader(Term[%d], LeaderCommit[%d], PrevLogIndex[%d], PrevLogTerm[%d], EntriesNum[%d]) %d",
-		rf.state.currentTerm, rf.state.commitIndex, rf.state.nextIndex[rf.self], rf.state.matchIndex[rf.self],
+		rf.state.CurrentTerm, rf.state.commitIndex, rf.state.nextIndex[rf.self], rf.state.matchIndex[rf.self],
 		rf.self, args.Term, args.LeaderCommit, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderID)
 
 	// old leader's heartbeat
-	if rf.state.currentTerm > args.Term {
-		DPrintf("server %d term > old leader %d term, (%d > %d)", rf.self, args.LeaderID, rf.state.currentTerm, args.Term)
-		reply.Term = rf.state.currentTerm
+	if rf.state.CurrentTerm > args.Term {
+		DPrintf("server %d term > old leader %d term, (%d > %d)", rf.self, args.LeaderID, rf.state.CurrentTerm, args.Term)
+		reply.Term = rf.state.CurrentTerm
 		reply.Success = false
 		return
 	}
@@ -255,7 +269,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(args.Entries) == 0 {
 		DPrintf("No entries, server %d oldCommitIndex: %d, leaderCommit: %d, matchIndex: %d",
 			rf.self, rf.state.commitIndex, args.LeaderCommit, rf.state.matchIndex[rf.self])
+		oldCommitIndex := rf.state.commitIndex
 		rf.state.commitIndex = utils.Min(args.LeaderCommit, rf.state.matchIndex[rf.self])
+
+		if oldCommitIndex > rf.state.commitIndex {
+			log.Printf("LeaderCommit: %d, matchIndex: %d, oldCommitIndex: %d", args.LeaderCommit, rf.state.matchIndex[rf.self], oldCommitIndex)
+			panic("???????????????????????")
+		}
 		return
 	}
 
@@ -280,11 +300,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// DPrintf("ServerID: %d, ServerState: %v", rf.self, oldState)
 		DPrintf("========AppendEntriesReq========")
 		DPrintf("AppendEntriesArgs: %v", args)
-
-		panic("!!!!!dangerous")
+		panic("newMatchIndex >= logLength, dangerous!!!")
 	}
 
+	oldCommitIndex := rf.state.commitIndex
 	rf.state.commitIndex = utils.Min(args.LeaderCommit, newMatchIndex)
+
+	if oldCommitIndex > rf.state.commitIndex {
+		log.Printf("LeaderCommit: %d, matchIndex: %d, oldCommitIndex: %d", args.LeaderCommit, rf.state.matchIndex[rf.self], oldCommitIndex)
+
+		panic("commitIndex decrease, dangerous!!!!!")
+	}
 
 	rf.state.matchIndex[rf.self] = newMatchIndex
 	rf.state.nextIndex[rf.self] = newNextIndex
@@ -313,14 +339,14 @@ func (rf *Raft) accessed() bool {
 	return rf.state.accessed
 }
 
-// 1. if currentTerm < peer.Term || currentTerm hasn't voted to any or already voted to peer
+// 1. if CurrentTerm < peer.Term || CurrentTerm hasn't voted to any or already voted to peer
 // 2. and peer's log at least up to date as current
 func (rf *Raft) tryVote(args *RequestVoteArgs) bool {
 	lastLogIndex := len(rf.state.log) - 1
 	lastLogTerm := rf.state.log[lastLogIndex].Term
 
 	// candidate from old term or candidate's log is too old, refused
-	if rf.state.currentTerm > args.Term ||
+	if rf.state.CurrentTerm > args.Term ||
 		args.LastLogTerm < lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm &&
 			args.LastLogIndex < lastLogIndex) {
@@ -328,9 +354,9 @@ func (rf *Raft) tryVote(args *RequestVoteArgs) bool {
 	}
 
 	// same term but already voted to others, refused
-	if rf.state.currentTerm == args.Term &&
-		rf.state.votedFor != InitialVoteFor &&
-		rf.state.votedFor != args.CandidateID {
+	if rf.state.CurrentTerm == args.Term &&
+		rf.state.VotedFor != InitialVoteFor &&
+		rf.state.VotedFor != args.CandidateID {
 		return false
 	}
 
@@ -389,31 +415,54 @@ func (rf *Raft) election() {
 			rf.wg.Done()
 			return
 		case <-ticker.C:
-			requestVoteArgs, needElection := rf.prepareElection()
-			if !needElection {
+			requestVoteArgs, needElection, err := rf.prepareElection()
+			if err != nil || !needElection {
 				continue
 			}
 
-			DPrintf("server: %d start election, currentTerm: %d", rf.self, requestVoteArgs.Term)
+			DPrintf("server: %d start election, CurrentTerm: %d", rf.self, requestVoteArgs.Term)
 
 			rf.doElection(requestVoteArgs)
 		}
 	}
 }
 
-func (rf *Raft) prepareElection() (*RequestVoteArgs, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (rf *Raft) prepareElection() (*RequestVoteArgs, bool, error) {
+	persistVoteFor, persistCurrentTerm := 0, 0
 
+	rf.mu.Lock()
 	if rf.accessed() || rf.state.role == LeaderRole {
 		rf.clearAccessed()
-		return nil, false
+		rf.mu.Unlock()
+		return nil, false, nil
 	}
 
 	rf.becomeCandidate()
+	persistVoteFor, persistCurrentTerm = rf.state.VotedFor, rf.state.CurrentTerm
+	requestVoteArgs := rf.genRequestVoteArgs()
+	rf.mu.Unlock()
 
-	return rf.genRequestVoteArgs(), true
+	var err error
 
+	if err = rf.persistVoteInfo(persistVoteFor, persistCurrentTerm); err != nil {
+		DPrintf("Persist VoteInfo failed, err: %d", err.Error())
+	}
+
+	return requestVoteArgs, true, err
+}
+
+func (rf *Raft) persistVoteInfo(voteFor, currentTerm int) error {
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+	if err := encoder.Encode(rf.state.VotedFor); err != nil {
+		return err
+	}
+	if err := encoder.Encode(rf.state.CurrentTerm); err != nil {
+		return err
+	}
+	data := buffer.Bytes()
+	rf.persister.SaveRaftState(data)
+	return nil
 }
 
 func (rf *Raft) genRequestVoteArgs() *RequestVoteArgs {
@@ -421,7 +470,7 @@ func (rf *Raft) genRequestVoteArgs() *RequestVoteArgs {
 	lastLogTerm := rf.state.log[lastLogIndex].Term
 
 	return &RequestVoteArgs{
-		Term:         rf.state.currentTerm,
+		Term:         rf.state.CurrentTerm,
 		CandidateID:  rf.self,
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
@@ -430,8 +479,8 @@ func (rf *Raft) genRequestVoteArgs() *RequestVoteArgs {
 
 func (rf *Raft) becomeCandidate() {
 	rf.state.role = CandidateRole
-	rf.state.currentTerm++
-	rf.state.votedFor = rf.self
+	rf.state.CurrentTerm++
+	rf.state.VotedFor = rf.self
 }
 
 func (rf *Raft) doElection(requestVoteArgs *RequestVoteArgs) {
@@ -443,13 +492,13 @@ func (rf *Raft) doElection(requestVoteArgs *RequestVoteArgs) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.isFollower() || maxTerm > rf.state.currentTerm || voteGrantedNum <= rf.halfPeer {
-		rf.becomeFollower(utils.Max(maxTerm, rf.state.currentTerm))
+	if rf.isFollower() || maxTerm > rf.state.CurrentTerm || voteGrantedNum <= rf.halfPeer {
+		rf.becomeFollower(utils.Max(maxTerm, rf.state.CurrentTerm))
 		return
 	}
 
 	rf.becomeLeader()
-	// rf.state.votedFor = -1
+	// rf.state.VotedFor = -1
 }
 
 // becomeLeader need lock outside
@@ -560,7 +609,7 @@ func (rf *Raft) checkAndIncCommitIndex() {
 			}
 
 			rf.mu.Lock()
-			if rf.state.log[newIndex].Term == rf.state.currentTerm {
+			if rf.state.log[newIndex].Term == rf.state.CurrentTerm {
 				rf.state.commitIndex = newIndex
 			}
 			rf.mu.Unlock()
@@ -601,7 +650,11 @@ func (rf *Raft) applyMessage() {
 			return
 		case <-ticker.C:
 			rf.mu.RLock()
-			// DPrintf("server %d try to apply message, lastApplied: %d, commitIndex: %d", rf.self, rf.state.lastApplied, rf.state.commitIndex)
+
+			if rf.state.commitIndex < rf.state.lastApplied {
+				panic("commitIndex < lastApplied, dangerous!!!!!")
+			}
+
 			toApplyEntries := make([]ApplyMsg, 0, rf.state.commitIndex-rf.state.lastApplied)
 			// toApplyEntries := make([]ApplyMsg, 0)
 			for i := rf.state.lastApplied + 1; i <= rf.state.commitIndex; i++ {
@@ -663,11 +716,17 @@ func (rf *Raft) doSendAppendEntriesRequest(dstServerIndex int) {
 	)
 
 	rf.mu.RLock()
+	// Note: maybe here current server wasn't a leader, need check again!!!
+	if rf.state.role != LeaderRole {
+		rf.mu.RUnlock()
+		return
+	}
+
 	sendStartIndex := rf.state.nextIndex[dstServerIndex]
 	prevLogIndex = sendStartIndex - 1
 	prevLogTerm = rf.state.log[prevLogIndex].Term
 	logNum = len(rf.state.log)
-	currentTerm = rf.state.currentTerm
+	currentTerm = rf.state.CurrentTerm
 	toSendLog = make([]LogEntry, logNum-sendStartIndex)
 	copy(toSendLog, rf.state.log[sendStartIndex:])
 	commitIndex = rf.state.commitIndex
@@ -691,10 +750,15 @@ func (rf *Raft) doSendAppendEntriesRequest(dstServerIndex int) {
 		return
 	}
 
-	DPrintf("Leader(Term[%d]) %d receive logEntries response from follower %d, entries num: %d", rf.state.currentTerm, rf.self, dstServerIndex, len(toSendLog))
+	DPrintf("Leader(Term[%d]) %d receive logEntries response from follower %d, entries num: %d", rf.state.CurrentTerm, rf.self, dstServerIndex, len(toSendLog))
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if rf.state.CurrentTerm < reply.Term {
+		DPrintf("old leader(Term[%d]) %d receive higher term[%d] from server %d, become follower", rf.state.CurrentTerm, rf.self, reply.Term, dstServerIndex)
+		rf.becomeFollower(reply.Term)
+	}
 
 	// do nothing
 	if rf.state.role != LeaderRole {
@@ -704,15 +768,6 @@ func (rf *Raft) doSendAppendEntriesRequest(dstServerIndex int) {
 	// update follower's nextIndex and matchIndex
 	rf.state.nextIndex[dstServerIndex] = utils.Min(len(rf.state.log), reply.NextIndex)
 	rf.state.matchIndex[dstServerIndex] = rf.state.nextIndex[dstServerIndex] - 1
-
-	if reply.Success {
-		return
-	}
-
-	if rf.state.currentTerm < reply.Term {
-		DPrintf("old leader(Term[%d]) %d receive higher term[%d] from server %d, become follower", rf.state.currentTerm, rf.self, reply.Term, dstServerIndex)
-		rf.becomeFollower(reply.Term)
-	}
 }
 
 func newRaft(peers []*labrpc.ClientEnd, self int, persister *Persister, applyCh chan ApplyMsg) *Raft {
@@ -725,8 +780,8 @@ func newRaft(peers []*labrpc.ClientEnd, self int, persister *Persister, applyCh 
 		self:      self,
 		state: &State{
 			role:        InitialRole,
-			currentTerm: InitialTerm,
-			votedFor:    InitialVoteFor,
+			CurrentTerm: InitialTerm,
+			VotedFor:    InitialVoteFor,
 			commitIndex: InitialCommitIndex,
 			lastApplied: InitialLastApplied,
 			nextIndex:   genInitialNextIndex(len(peers)),

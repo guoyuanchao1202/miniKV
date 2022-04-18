@@ -31,7 +31,6 @@ const (
 	LeaderRole
 )
 
-
 const (
 	Running int32 = iota
 	Killing
@@ -40,8 +39,8 @@ const (
 
 type State struct {
 	role        RoleType   // leader / follower / candidate
-	currentTerm int        // current term
-	votedFor    int        // vote peer id
+	CurrentTerm int        // current term
+	VotedFor    int        // vote peer id
 	commitIndex int        // committed index
 	lastApplied int        // applied index ( <= commitIndex)
 	nextIndex   []int      // only leader use
@@ -53,8 +52,8 @@ type State struct {
 func (s *State) clone() *State {
 	cState := &State{
 		role:        s.role,
-		currentTerm: s.currentTerm,
-		votedFor:    s.votedFor,
+		CurrentTerm: s.CurrentTerm,
+		VotedFor:    s.VotedFor,
 		commitIndex: s.commitIndex,
 		lastApplied: s.lastApplied,
 		nextIndex:   make([]int, len(s.nextIndex)),
