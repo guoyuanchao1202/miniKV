@@ -1,11 +1,11 @@
 package raft
 
 //
-// ApplyMsg as each Raft peer becomes aware that successive log entries are
+// ApplyMsg as each Raft peer becomes aware that successive Log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
 // CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
+// committed Log entry.
 //
 // in part 2D you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh, but set CommandValid to false for these
@@ -46,7 +46,7 @@ type State struct {
 	nextIndex   []int      // only leader use
 	matchIndex  []int      // only leader use, used to inc commitIndex
 	accessed    bool       // only follower use
-	log         []LogEntry // logs
+	Log         []LogEntry // logs
 }
 
 func (s *State) clone() *State {
@@ -59,12 +59,12 @@ func (s *State) clone() *State {
 		nextIndex:   make([]int, len(s.nextIndex)),
 		matchIndex:  make([]int, len(s.matchIndex)),
 		accessed:    s.accessed,
-		log:         make([]LogEntry, len(s.log)),
+		Log:         make([]LogEntry, len(s.Log)),
 	}
 
 	copy(cState.nextIndex, s.nextIndex)
 	copy(cState.matchIndex, s.matchIndex)
-	copy(cState.log, s.log)
+	copy(cState.Log, s.Log)
 	return cState
 }
 
