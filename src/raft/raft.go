@@ -22,6 +22,8 @@ import (
 	"6.824/utils"
 	"bytes"
 	"context"
+	"log"
+
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -103,6 +105,11 @@ func (rf *Raft) readPersist(data []byte) error {
 	}
 
 	rf.state.nextIndex[rf.self] = len(rf.state.Log)
+	if rf.state.nextIndex[rf.self] == 0 {
+		log.Printf("Server %d readPersist, initNextIndex: %d", rf.self, len(rf.state.Log))
+		panic("dangerous!!!!!")
+	}
+
 	rf.state.matchIndex[rf.self] = rf.state.nextIndex[rf.self] - 1
 	return nil
 }
@@ -147,7 +154,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return InvalidIndex, rf.state.CurrentTerm, false
 	}
 
-	DPrintf("Leader(Term[%d]) %d receive command: %v", rf.state.CurrentTerm, rf.self, command)
+	//DPrintf("Leader(Term[%d]) %d receive command: %v", rf.state.CurrentTerm, rf.self, command)
 
 	entry := rf.addToLogCache(command)
 
@@ -209,7 +216,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.becomeFollower(args.Term)
 	}
 
-	DPrintf("server %d vote to %d, reply.Term: %d, reply.Vote: %t", rf.self, args.CandidateID, reply.Term, reply.VoteGranted)
+	// DPrintf("server %d vote to %d, reply.Term: %d, reply.Vote: %t", rf.self, args.CandidateID, reply.Term, reply.VoteGranted)
 
 	rf.persist()
 
@@ -232,20 +239,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	DPrintf("Server(Term[%d], commitIndex[%d], nextIndex[%d], matchIndex[%d]) %d receive entries from Leader(Term[%d], LeaderCommit[%d], PrevLogIndex[%d], PrevLogTerm[%d], EntriesNum[%d]) %d",
-		rf.state.CurrentTerm, rf.state.commitIndex, rf.state.nextIndex[rf.self], rf.state.matchIndex[rf.self],
-		rf.self, args.Term, args.LeaderCommit, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderID)
+	reply.NextIndex = rf.state.nextIndex[rf.self]
+	reply.MatchIndex = rf.state.matchIndex[rf.self]
+
+	//DPrintf("Server(Term[%d], commitIndex[%d], nextIndex[%d], matchIndex[%d]) %d receive entries from Leader(Term[%d], LeaderCommit[%d], PrevLogIndex[%d], PrevLogTerm[%d], EntriesNum[%d]) %d",
+	//	rf.state.CurrentTerm, rf.state.commitIndex, rf.state.nextIndex[rf.self], rf.state.matchIndex[rf.self],
+	//	rf.self, args.Term, args.LeaderCommit, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderID)
 
 	// old leader's heartbeat
 	if rf.state.CurrentTerm > args.Term {
-		DPrintf("server %d term > old leader %d term, (%d > %d)", rf.self, args.LeaderID, rf.state.CurrentTerm, args.Term)
+		DPrintf("Current Server(term[%d], commitIndex[%d], lastApplied[%d], nextIndex[%d], log[%d]) %d Term > OldLeader(commitIndex[%d], prevLogIndex[%d]) %d",
+			rf.state.CurrentTerm, rf.state.commitIndex, rf.state.lastApplied, rf.state.nextIndex[rf.self], len(rf.state.Log), rf.self, args.LeaderCommit, args.PrevLogIndex, args.LeaderID)
+		// DPrintf("server %d term > old leader %d term, (%d > %d)", rf.self, args.LeaderID, rf.state.CurrentTerm, args.Term)
 		reply.Term = rf.state.CurrentTerm
 		reply.Success = false
 		return
 	}
 
-	reply.NextIndex = rf.state.nextIndex[rf.self]
-	reply.MatchIndex = rf.state.matchIndex[rf.self]
 	rf.markAccessed()
 	if args.Term > rf.state.CurrentTerm {
 		rf.persist()
@@ -254,18 +264,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// current follower Log is much behind.
 	if args.PrevLogIndex > reply.MatchIndex {
-		DPrintf("Server %d matchIndex[%d] < Leader %d prevLogIndex[%d], return",
-			rf.self, rf.state.matchIndex[rf.self], args.LeaderID, args.PrevLogIndex)
+		DPrintf("Current Server(term[%d], commitIndex[%d], lastApplied[%d], nextIndex[%d], log[%d]) %d Log too short than Leader(commitIndex[%d], prevLogIndex[%d]) %d",
+			rf.state.CurrentTerm, rf.state.commitIndex, rf.state.lastApplied,
+			rf.state.nextIndex[rf.self], len(rf.state.Log), rf.self,
+			args.LeaderCommit, args.PrevLogIndex, args.LeaderID)
 		return
 	}
 
 	// conflict
 	if rf.state.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		DPrintf("Server(PrevLogTerm[%d]) %d conflict with Leader(PrevLogTerm[%d]) %d, conflictIndex: %d",
-			rf.state.Log[args.PrevLogIndex].Term, rf.self, args.PrevLogTerm, args.LeaderID, args.PrevLogIndex)
-		rf.removeConflictLog(args.PrevLogIndex)
-		reply.NextIndex = args.PrevLogIndex
-		reply.MatchIndex = args.PrevLogIndex - 1
+		DPrintf("Current Server(term[%d], commitIndex[%d], lastApplied[%d], nextIndex[%d], log[%d]) %d conflict with Leader(commitIndex[%d], prevLogIndex[%d]) %d",
+			rf.state.CurrentTerm, rf.state.commitIndex, rf.state.lastApplied,
+			rf.state.nextIndex[rf.self], len(rf.state.Log), rf.self,
+			args.LeaderCommit, args.PrevLogIndex, args.LeaderID)
+
+		reply.NextIndex = rf.removeConflictLog(args.PrevLogIndex-1, rf.state.Log[args.PrevLogIndex].Term)
+		//reply.NextIndex = args.PrevLogIndex
+		if reply.NextIndex == 0 {
+			log.Printf("Server %d NextIndex: %d", rf.self, reply.NextIndex)
+			panic("dangerous!!!!")
+		}
+		reply.MatchIndex = reply.NextIndex - 1
 		reply.Success = false
 		return
 	}
@@ -274,18 +293,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// no new Log entries
 	if len(args.Entries) == 0 {
-		DPrintf("No entries, server %d oldCommitIndex: %d, leaderCommit: %d, matchIndex: %d",
-			rf.self, rf.state.commitIndex, args.LeaderCommit, rf.state.matchIndex[rf.self])
-
 		if args.LeaderCommit < rf.state.commitIndex {
-			DPrintf("Leader(commitIndex[%d]) %d < Server(commitIndex[%d]) %d, maybe restart", args.LeaderID, args.LeaderCommit, rf.state.commitIndex, rf.self)
+			// DPrintf("Leader(commitIndex[%d]) %d < Server(commitIndex[%d]) %d, maybe restart", args.LeaderID, args.LeaderCommit, rf.state.commitIndex, rf.self)
 			return
 		}
 		rf.state.commitIndex = utils.Min(args.LeaderCommit, rf.state.matchIndex[rf.self])
 		return
 	}
-
-	// oldState := rf.state.clone()
 
 	newMatchIndex := args.PrevLogIndex + len(args.Entries)
 	newNextIndex := newMatchIndex + 1
@@ -311,25 +325,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		panic("newMatchIndex >= logLength, dangerous!!!")
 	}
 
-
 	rf.state.matchIndex[rf.self] = newMatchIndex
 	rf.state.nextIndex[rf.self] = newNextIndex
 
 	reply.NextIndex = newNextIndex
 	reply.MatchIndex = newMatchIndex
 
+	if reply.NextIndex == 0 {
+		log.Printf("Server %d NextIndex: %d", rf.self, reply.NextIndex)
+		panic("dangerous!!!!")
+	}
+
 	if args.LeaderCommit < rf.state.commitIndex {
-		DPrintf("Leader(commitIndex[%d]) %d < Server(commitIndex[%d]) %d, maybe restart", args.LeaderID, args.LeaderCommit, rf.state.commitIndex, rf.self)
+		// DPrintf("Leader(commitIndex[%d]) %d < Server(commitIndex[%d]) %d, maybe restart", args.LeaderID, args.LeaderCommit, rf.state.commitIndex, rf.self)
 		return
 	}
 	rf.state.commitIndex = utils.Min(args.LeaderCommit, newMatchIndex)
 	return
 }
 
-func (rf *Raft) removeConflictLog(newNextIndex int) {
+func (rf *Raft) removeConflictLog(endIndex, term int) int {
+	newNextIndex := endIndex
+	for newNextIndex = endIndex; newNextIndex > 0 && rf.state.Log[newNextIndex].Term == term; newNextIndex-- {
+	}
+	newNextIndex++
+
 	rf.state.Log = rf.state.Log[:newNextIndex]
 	rf.state.matchIndex[rf.self] = newNextIndex - 1
 	rf.state.nextIndex[rf.self] = newNextIndex
+
+	return newNextIndex
 }
 
 func (rf *Raft) markAccessed() {
@@ -425,7 +450,7 @@ func (rf *Raft) election() {
 				continue
 			}
 
-			DPrintf("server: %d start election, CurrentTerm: %d", rf.self, requestVoteArgs.Term)
+			// DPrintf("server: %d start election, CurrentTerm: %d", rf.self, requestVoteArgs.Term)
 
 			rf.doElection(requestVoteArgs)
 		}
@@ -444,7 +469,6 @@ func (rf *Raft) prepareElection() (*RequestVoteArgs, bool) {
 	rf.becomeCandidate()
 	requestVoteArgs := rf.genRequestVoteArgs()
 
-	// todo: persist info
 	rf.persist()
 
 	return requestVoteArgs, true
@@ -484,8 +508,6 @@ func (rf *Raft) doElection(requestVoteArgs *RequestVoteArgs) {
 	}
 
 	rf.becomeLeader()
-
-	// rf.state.VotedFor = -1
 }
 
 // becomeLeader need lock outside
@@ -496,7 +518,7 @@ func (rf *Raft) becomeLeader() {
 		rf.state.nextIndex[i] = nextIndex
 	}
 
-	DPrintf("server %d become new Leader, reset nextIndex to %d, currentLog: %v", rf.self, nextIndex, rf.state.Log)
+	// DPrintf("server %d become new Leader, reset nextIndex to %d, currentLog: %v", rf.self, nextIndex, rf.state.Log)
 }
 
 func (rf *Raft) sendVoteRequest(requestVoteArgs *RequestVoteArgs, repliesCh chan *RequestVoteReply) {
@@ -522,12 +544,9 @@ func (rf *Raft) tryCollectVoteReply(repliesCh chan *RequestVoteReply) (int, int)
 	for i := 0; i < len(rf.peers)-1 && voteGrantedNum <= rf.halfPeer; i++ {
 		select {
 		case reply := <-repliesCh:
+
 			if reply.VoteGranted {
 				voteGrantedNum++
-				continue
-			}
-
-			if reply.Term == -1 {
 				continue
 			}
 
@@ -718,8 +737,8 @@ func (rf *Raft) doSendAppendEntriesRequest(dstServerIndex int) {
 	copy(toSendLog, rf.state.Log[sendStartIndex:])
 	commitIndex = rf.state.commitIndex
 
-	DPrintf("Leader(Term[%d], commitIndex[%d], prevLogIndex[%d], prevLogTerm[%d]) %d send logEntries to follower %d, entries num: %d",
-		currentTerm, commitIndex, prevLogIndex, prevLogTerm, rf.self, dstServerIndex, len(toSendLog))
+	//DPrintf("Leader(Term[%d], commitIndex[%d], prevLogIndex[%d], prevLogTerm[%d]) %d send logEntries to follower %d, entries num: %d",
+	//	currentTerm, commitIndex, prevLogIndex, prevLogTerm, rf.self, dstServerIndex, len(toSendLog))
 	rf.persist()
 	rf.mu.RUnlock()
 
@@ -737,13 +756,13 @@ func (rf *Raft) doSendAppendEntriesRequest(dstServerIndex int) {
 		return
 	}
 
-	DPrintf("Leader(Term[%d]) %d receive logEntries response from follower %d, entries num: %d", rf.state.CurrentTerm, rf.self, dstServerIndex, len(toSendLog))
+	// DPrintf("Leader(Term[%d]) %d receive logEntries response from follower %d, entries num: %d", rf.state.CurrentTerm, rf.self, dstServerIndex, len(toSendLog))
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if rf.state.CurrentTerm < reply.Term {
-		DPrintf("old leader(Term[%d]) %d receive higher term[%d] from server %d, become follower", rf.state.CurrentTerm, rf.self, reply.Term, dstServerIndex)
+		// DPrintf("old leader(Term[%d]) %d receive higher term[%d] from server %d, become follower", rf.state.CurrentTerm, rf.self, reply.Term, dstServerIndex)
 		rf.becomeFollower(reply.Term)
 		rf.persist()
 	}
@@ -753,9 +772,15 @@ func (rf *Raft) doSendAppendEntriesRequest(dstServerIndex int) {
 		return
 	}
 
+	newNextIndex := utils.Min(len(rf.state.Log), reply.NextIndex)
+
+	if !reply.Success && newNextIndex > rf.state.nextIndex[dstServerIndex] {
+		return
+	}
+
 	// update follower's nextIndex and matchIndex
-	rf.state.nextIndex[dstServerIndex] = utils.Min(len(rf.state.Log), reply.NextIndex)
-	rf.state.matchIndex[dstServerIndex] = rf.state.nextIndex[dstServerIndex] - 1
+	rf.state.nextIndex[dstServerIndex] = newNextIndex
+	rf.state.matchIndex[dstServerIndex] = newNextIndex - 1
 }
 
 func newRaft(peers []*labrpc.ClientEnd, self int, persister *Persister, applyCh chan ApplyMsg) *Raft {
